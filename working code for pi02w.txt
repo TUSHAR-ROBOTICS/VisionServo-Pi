@@ -1,0 +1,102 @@
+import cv2
+import numpy as np
+import subprocess
+from gpiozero import AngularServo
+from time import sleep
+
+# --- SERVO INITIALIZATION ---
+# SG90 typical pulse widths are around 0.5ms to 2.5ms for a 180-degree sweep
+# We clamp the angles slightly to prevent the gears from straining at the edges
+pan_servo = AngularServo(17, initial_angle=0, min_angle=-90, max_angle=90, min_pulse_width=0.0005, max_pulse_width=0.0025)
+tilt_servo = AngularServo(27, initial_angle=0, min_angle=-90, max_angle=90, min_pulse_width=0.0005, max_pulse_width=0.0025)
+
+# Current positions tracking (start dead center)
+current_pan = 0.0
+current_tilt = 0.0
+
+# --- CAMERA STREAM INITIALIZATION ---
+WIDTH, HEIGHT = 640, 480
+FRAME_SIZE = WIDTH * HEIGHT * 3
+CENTER_X, CENTER_Y = WIDTH // 2, HEIGHT // 2  # (320, 240)
+
+cmd = [
+    "rpicam-vid", "-t", "0",
+    "--width", str(WIDTH), "--height", str(HEIGHT),
+    "--framerate", "30", "--codec", "yuv420", "-o", "-"
+]
+
+process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=FRAME_SIZE)
+print("Tracking Turret Active! Calibrating servos to center...")
+sleep(1)
+
+print("System Ready. Lock on target to begin mechanical tracking. Press 'q' to quit.")
+
+try:
+    while True:
+        yuv_size = (WIDTH * HEIGHT * 3) // 2
+        raw_bytes = process.stdout.read(yuv_size)
+        if len(raw_bytes) != yuv_size:
+            break
+
+        yuv_frame = np.frombuffer(raw_bytes, dtype=np.uint8).reshape((HEIGHT * 3 // 2, WIDTH))
+        frame = cv2.cvtColor(yuv_frame, cv2.COLOR_YUV2BGR_I420)
+
+        # Vision processing: Brightness detection
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        blurred = cv2.GaussianBlur(gray, (11, 11), 0)
+        _, bright_mask = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY)
+        
+        mask_element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN, mask_element)
+        contours, _ = cv2.findContours(bright_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+
+        if contours:
+            largest_contour = max(contours, key=cv2.contourArea)
+            if cv2.contourArea(largest_contour) > 500:
+                M = cv2.moments(largest_contour)
+                if M["m00"] != 0:
+                    cX = int(M["m10"] / M["m00"])
+                    cY = int(M["m01"] / M["m00"])
+                    
+                    # --- TRACKING MATH ---
+                    # Calculate how many pixels away from the absolute center the target is
+                    error_x = cX - CENTER_X
+                    error_y = cY - CENTER_Y
+
+                    # "Proportional Gain" -> maps pixel error to small servo degree adjustments
+                    # A value of 0.05 means a 100-pixel error adjusts the servo by 5 degrees
+                    gain = 0.05 
+
+                    # Update angles based on target direction
+                    # (Note: depending on how your servos are physically mounted, 
+                    # you might need to change a '+' to a '-' to correct reversed directions)
+                    current_pan -= (error_x * gain)
+                    current_tilt += (error_y * gain)
+
+                    # Keep servo boundaries strictly within the safe physical -90 to 90 range
+                    current_pan = max(-90.0, min(90.0, current_pan))
+                    current_tilt = max(-90.0, min(90.0, current_tilt))
+
+                    # Command the physical pins to update servo positions
+                    pan_servo.angle = current_pan
+                    tilt_servo.angle = current_tilt
+
+                    print(f"Tracking -> Target: ({cX}, {cY}) | Servos -> Pan: {current_pan:.1f}° | Tilt: {current_tilt:.1f}°")
+            else:
+                print("Searching... Target detected but too small.")
+        else:
+            print("Searching... No bright target detected.")
+
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+except KeyboardInterrupt:
+    print("\nProgram stopped manually.")
+
+finally:
+    process.terminate()
+    process.wait()
+    # Detach servos smoothly to stop mechanical buzzing on exit
+    pan_servo.close()
+    tilt_servo.close()
+    print("System offline. Servos released safely.")
